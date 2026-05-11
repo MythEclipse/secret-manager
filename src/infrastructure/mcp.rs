@@ -1,14 +1,12 @@
 use crate::application::use_cases::SecretService;
 use crate::domain::repositories::SecretRepository;
 use async_trait::async_trait;
-use futures::Stream;
 use mcp_sdk_rs::{
     error::{Error, ErrorCode},
     server::ServerHandler,
-    transport::Transport,
+    transport::stdio::StdioTransport,
     types::{Implementation, ServerCapabilities},
 };
-use std::pin::Pin;
 use std::sync::Arc;
 
 pub struct SecretManagerHandler<R: SecretRepository> {
@@ -65,7 +63,7 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
                         },
                         {
                             "name": "get_secret",
-                            "description": "Retrieve a secret by name",
+                            "description": "Retrieve a secret name",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -104,79 +102,49 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
     }
 }
 
-struct ChannelTransport {
-    input: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
-    output: tokio::sync::mpsc::Sender<String>,
-}
-
-impl ChannelTransport {
-    fn new(input: tokio::sync::mpsc::Receiver<String>, output: tokio::sync::mpsc::Sender<String>) -> Self {
-        Self {
-            input: Arc::new(tokio::sync::Mutex::new(input)),
-            output
-        }
-    }
-}
-
-#[async_trait]
-impl Transport for ChannelTransport {
-    async fn send(&self, message: mcp_sdk_rs::transport::Message) -> Result<(), Error> {
-        let json = serde_json::to_string(&message).map_err(|e| Error::Transport(e.to_string()))?;
-        self.output.send(json).await.map_err(|_| Error::Transport("send failed".to_string()))?;
-        Ok(())
-    }
-
-    fn receive(&self) -> Pin<Box<dyn Stream<Item = Result<mcp_sdk_rs::transport::Message, Error>> + Send>> {
-        let input = self.input.clone();
-        Box::pin(async_stream::stream! {
-            let mut input = input.lock().await;
-            while let Some(line) = input.recv().await {
-                match serde_json::from_str::<mcp_sdk_rs::transport::Message>(&line) {
-                    Ok(msg) => yield Ok(msg),
-                    Err(e) => yield Err(Error::Transport(e.to_string())),
-                }
-            }
-        })
-    }
-
-    async fn close(&self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
 pub async fn run_mcp_server<R: SecretRepository + 'static>(
     service: SecretService<R>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
-
     let handler = SecretManagerHandler::new(service);
 
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(100);
     let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<String>(100);
 
-    let transport = ChannelTransport::new(stdin_rx, stdout_tx);
+    let transport = StdioTransport::new(stdin_rx, stdout_tx);
 
     let server = mcp_sdk_rs::server::Server::new(
         Arc::new(transport),
         Arc::new(handler),
     );
 
-    let stdin = BufReader::new(tokio::io::stdin());
-
+    // Read stdin in spawned task
+    let stdin_tx_clone = stdin_tx.clone();
     tokio::spawn(async move {
-        let mut lines = stdin.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if stdin_tx.send(line).await.is_err() {
-                break;
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = buf.trim().to_string();
+                    if !line.is_empty() && stdin_tx_clone.send(line).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
+    // Write stdout in spawned task
     tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
+        let stdout = tokio::io::stdout();
+        let mut stdout = tokio::io::BufWriter::new(stdout);
         let mut rx = stdout_rx;
         while let Some(msg) = rx.recv().await {
-            if stdout.write_all((msg + "\n").as_bytes()).await.is_err() {
+            use tokio::io::AsyncWriteExt;
+            if stdout.write_all(format!("{}\n", msg).as_bytes()).await.is_err() {
                 break;
             }
             if stdout.flush().await.is_err() {
@@ -184,8 +152,6 @@ pub async fn run_mcp_server<R: SecretRepository + 'static>(
             }
         }
     });
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     server.start().await.map_err(|e| anyhow::anyhow!("MCP error: {:?}", e))
 }
