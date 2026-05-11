@@ -2152,6 +2152,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "async-stream",
  "async-trait",
  "chrono",
  "clap",

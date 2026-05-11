@@ -1,12 +1,14 @@
 use crate::application::use_cases::SecretService;
 use crate::domain::repositories::SecretRepository;
 use async_trait::async_trait;
+use futures::Stream;
 use mcp_sdk_rs::{
     error::{Error, ErrorCode},
     server::ServerHandler,
-    transport::stdio::StdioTransport,
+    transport::Transport,
     types::{Implementation, ServerCapabilities},
 };
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub struct SecretManagerHandler<R: SecretRepository> {
@@ -102,19 +104,57 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
     }
 }
 
+struct ChannelTransport {
+    input: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
+    output: tokio::sync::mpsc::Sender<String>,
+}
+
+impl ChannelTransport {
+    fn new(input: tokio::sync::mpsc::Receiver<String>, output: tokio::sync::mpsc::Sender<String>) -> Self {
+        Self {
+            input: Arc::new(tokio::sync::Mutex::new(input)),
+            output
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for ChannelTransport {
+    async fn send(&self, message: mcp_sdk_rs::transport::Message) -> Result<(), Error> {
+        let json = serde_json::to_string(&message).map_err(|e| Error::Transport(e.to_string()))?;
+        self.output.send(json).await.map_err(|_| Error::Transport("send failed".to_string()))?;
+        Ok(())
+    }
+
+    fn receive(&self) -> Pin<Box<dyn Stream<Item = Result<mcp_sdk_rs::transport::Message, Error>> + Send>> {
+        let input = self.input.clone();
+        Box::pin(async_stream::stream! {
+            let mut input = input.lock().await;
+            while let Some(line) = input.recv().await {
+                match serde_json::from_str::<mcp_sdk_rs::transport::Message>(&line) {
+                    Ok(msg) => yield Ok(msg),
+                    Err(e) => yield Err(Error::Transport(e.to_string())),
+                }
+            }
+        })
+    }
+
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 pub async fn run_mcp_server<R: SecretRepository + 'static>(
     service: SecretService<R>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::io::AsyncWriteExt;
-    use tokio::sync::broadcast;
+    use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 
     let handler = SecretManagerHandler::new(service);
 
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(100);
-    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<String>(100);
 
-    let transport = StdioTransport::new(stdin_rx, stdout_tx);
+    let transport = ChannelTransport::new(stdin_rx, stdout_tx);
 
     let server = mcp_sdk_rs::server::Server::new(
         Arc::new(transport),
@@ -123,54 +163,29 @@ pub async fn run_mcp_server<R: SecretRepository + 'static>(
 
     let stdin = BufReader::new(tokio::io::stdin());
 
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let shutdown_rx = shutdown_tx.subscribe();
-
-    let stdin_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut lines = stdin.lines();
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.recv() => break,
-                result = lines.next_line() => {
-                    match result {
-                        Ok(Some(line)) => {
-                            if stdin_tx.send(line).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
+        while let Ok(Some(line)) = lines.next_line().await {
+            if stdin_tx.send(line).await.is_err() {
+                break;
             }
         }
     });
 
-    let stdout_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.recv() => break,
-                msg = stdout_rx.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            let _ = stdout.write_all((msg + "\n").as_bytes()).await;
-                            let _ = stdout.flush().await;
-                        }
-                        None => break,
-                    }
-                }
+        let mut rx = stdout_rx;
+        while let Some(msg) = rx.recv().await {
+            if stdout.write_all((msg + "\n").as_bytes()).await.is_err() {
+                break;
+            }
+            if stdout.flush().await.is_err() {
+                break;
             }
         }
     });
 
-    let result = server.start().await.map_err(|e| anyhow::anyhow!("MCP error: {:?}", e));
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    let _ = shutdown_tx.send(());
-
-    let _ = stdin_handle.await;
-    let _ = stdout_handle.await;
-
-    result
+    server.start().await.map_err(|e| anyhow::anyhow!("MCP error: {:?}", e))
 }

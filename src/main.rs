@@ -54,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
     let password = cli.password.or_else(|| std::env::var("SM_PASSWORD").ok()).unwrap_or_else(|| {
         if matches!(cli.command, Commands::Mcp) {
              // For MCP, password must be provided via SM_PASSWORD env or flag
-             panic!("SM_PASSWORD environment variable or --password flag required for MCP mode")
+             eprintln!("ERROR: SM_PASSWORD environment variable or --password flag required for MCP mode");
+             std::process::exit(1);
         } else {
             rpassword::prompt_password("Enter Master Password: ").expect("failed to read password")
         }
