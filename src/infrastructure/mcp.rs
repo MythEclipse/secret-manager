@@ -71,6 +71,14 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
                                 },
                                 "required": ["name"]
                             }
+                        },
+                        {
+                            "name": "list_secrets",
+                            "description": "List all stored secret names",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
                         }
                     ]
                 }))
@@ -93,6 +101,16 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
                             Some(v) => Ok(serde_json::json!({ "content": [{ "type": "text", "text": format!("{}: {}", name, v) }] })),
                             None => Ok(serde_json::json!({ "content": [{ "type": "text", "text": "not found" }] })),
                         }
+                    }
+                    "list_secrets" => {
+                        let secrets = self.service.list_secrets().await.map_err(|e| Error::protocol(ErrorCode::InternalError, e.to_string()))?;
+                        let text = if secrets.is_empty() {
+                            "no secrets found".to_string()
+                        } else {
+                            secrets.join("\n")
+                        };
+
+                        Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
                     }
                     _ => Err(Error::protocol(ErrorCode::MethodNotFound, format!("unknown tool: {}", tool_name))),
                 }

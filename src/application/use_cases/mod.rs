@@ -8,10 +8,6 @@ use aes_gcm::{
 use chrono::Utc;
 use rand::{rngs::OsRng, RngCore};
 use uuid::Uuid;
-use argon2::{
-    password_hash::{PasswordHasher, SaltString},
-    Argon2, Params,
-};
 
 use zeroize::Zeroize;
 
@@ -27,30 +23,11 @@ impl<R: SecretRepository> Drop for SecretService<R> {
 }
 
 impl<R: SecretRepository> SecretService<R> {
-    pub fn new(repository: R, master_password: &str) -> Result<Self> {
-        let mut master_bytes = master_password.as_bytes().to_vec();
-        // Production: Use Argon2id for key derivation
-        let salt = SaltString::from_b64("U2VjcmV0U2FsdDEyM3NhbHQ").unwrap();
-        let argon2 = Argon2::new(
-            argon2::Algorithm::Argon2id,
-            argon2::Version::V0x13,
-            Params::default(),
-        );
-
-        let hash = argon2
-            .hash_password(&master_bytes, &salt)
-            .map_err(|e| anyhow::anyhow!("KDF error: {}", e))?;
-
-        master_bytes.zeroize();
-
-        let mut key = [0u8; 32];
-        if let Some(h) = hash.hash {
-            key.copy_from_slice(&h.as_bytes()[..32]);
-        } else {
-            return Err(anyhow::anyhow!("Failed to generate hash"));
-        }
-
-        Ok(Self { repository, encryption_key: key })
+    pub fn new(repository: R, encryption_key: [u8; 32]) -> Result<Self> {
+        Ok(Self {
+            repository,
+            encryption_key,
+        })
     }
 
     pub async fn add_secret(&self, name: String, value: &str) -> Result<()> {

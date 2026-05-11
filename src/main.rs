@@ -10,9 +10,6 @@ use directories::ProjectDirs;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-
-    #[arg(short, long)]
-    password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -34,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let proj_dirs = ProjectDirs::from("com", "antigravity", "secret-manager")
         .ok_or_else(|| anyhow::anyhow!("could not find config directory"))?;
     let db_path = proj_dirs.data_dir().join("secrets.db");
+    let key_path = proj_dirs.data_dir().join(".key");
     std::fs::create_dir_all(proj_dirs.data_dir())?;
 
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -51,17 +49,23 @@ async fn main() -> anyhow::Result<()> {
 
     let repo = SqliteSecretRepository::new(db);
 
-    let password = cli.password.or_else(|| std::env::var("SM_PASSWORD").ok()).unwrap_or_else(|| {
-        if matches!(cli.command, Commands::Mcp) {
-             // For MCP, password must be provided via SM_PASSWORD env or flag
-             eprintln!("ERROR: SM_PASSWORD environment variable or --password flag required for MCP mode");
-             std::process::exit(1);
-        } else {
-            rpassword::prompt_password("Enter Master Password: ").expect("failed to read password")
+    // Load or generate encryption key
+    let encryption_key = if key_path.exists() {
+        let key_data = std::fs::read(&key_path)?;
+        key_data.try_into().map_err(|_| anyhow::anyhow!("invalid key file"))?
+    } else {
+        let key: [u8; 32] = rand::random();
+        std::fs::write(&key_path, &key)?;
+        // Restrict permissions for security
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
         }
-    });
+        key
+    };
 
-    let service = SecretService::new(repo, &password)?;
+    let service = SecretService::new(repo, encryption_key)?;
 
     match cli.command {
         Commands::Add { name, value } => {
