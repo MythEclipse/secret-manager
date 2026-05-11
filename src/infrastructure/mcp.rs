@@ -43,6 +43,15 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, Error> {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/mcp_debug.log")
+            .map(|mut f| {
+                use std::io::Write;
+                let _ = writeln!(f, "Method: {}, Params: {:?}", method, params);
+            });
+
         let params = params.unwrap_or(serde_json::json!({}));
 
         match method {
@@ -105,13 +114,39 @@ impl<R: SecretRepository + 'static> ServerHandler for SecretManagerHandler<R> {
 pub async fn run_mcp_server<R: SecretRepository + 'static>(
     service: SecretService<R>,
 ) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncWriteExt;
+
     let handler = SecretManagerHandler::new(service);
-    let (transport, _sender) = StdioTransport::new();
+
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<String>(100);
+
+    let transport = StdioTransport::new(stdin_rx, stdout_tx);
 
     let server = mcp_sdk_rs::server::Server::new(
         Arc::new(transport),
         Arc::new(handler),
     );
+
+    let stdin = BufReader::new(tokio::io::stdin());
+
+    tokio::spawn(async move {
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if stdin_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(msg) = stdout_rx.recv().await {
+            let mut stdout = tokio::io::stdout();
+            let _ = stdout.write_all((msg + "\n").as_bytes()).await;
+            let _ = stdout.flush().await;
+        }
+    });
 
     server.start().await.map_err(|e| anyhow::anyhow!("MCP error: {:?}", e))?;
     Ok(())
