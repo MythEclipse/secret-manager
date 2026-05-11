@@ -51,12 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     let repo = SqliteSecretRepository::new(db);
 
-    let password = cli.password.unwrap_or_else(|| {
+    let password = cli.password.or_else(|| std::env::var("SM_PASSWORD").ok()).unwrap_or_else(|| {
         if matches!(cli.command, Commands::Mcp) {
              // For MCP, password must be provided via SM_PASSWORD env or flag
-             std::env::var("SM_PASSWORD").unwrap_or_else(|_| {
-                 panic!("SM_PASSWORD environment variable or --password flag required for MCP mode")
-             })
+             panic!("SM_PASSWORD environment variable or --password flag required for MCP mode")
         } else {
             rpassword::prompt_password("Enter Master Password: ").expect("failed to read password")
         }
