@@ -11,4 +11,7 @@ Access and manage secure secrets via MCP.
 Requires `SM_PASSWORD` environment variable.
 
 ## Usage
+Run manually via:
+/skill secret-manager "secret-manager mcp"
+
 Triggered automatically when the user asks for secrets or credentials managed by this tool.
